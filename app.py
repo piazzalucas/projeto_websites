@@ -11,9 +11,10 @@ st.set_page_config("Account Plan Intelligence", layout="wide")
 st.title("🔍 Account Plan Intelligence")
 st.markdown("""\
 1. Faça upload da sua lista de empresas (.xlsx)  
-2. Selecione o país  
-3. Ajuste o nível de similaridade  
-4. Clique em Processar e baixe o relatório completo  
+2. Selecione a coluna que contém o nome das empresas  
+3. Selecione o país  
+4. Ajuste o nível de similaridade  
+5. Clique em Processar e baixe o relatório completo  
 """)
 
 # --- Normalize names ---
@@ -32,7 +33,7 @@ def load_base():
     return df
 base = load_base()
 
-# --- Load backend reports from data/ using lowercase names ---
+# --- Load backend reports ---
 @st.cache_data
 def load_reports():
     data_folder = Path(__file__).parent / "data"
@@ -63,19 +64,22 @@ def lookup_opp(key, website):
     mask = df.iloc[:,3] == website
     return df.loc[mask].iloc[0,4] if mask.any() else None
 
-# --- Prepare matching ---
+# --- Matching preparation ---
 @st.cache_data
 def prepare_matching(country):
     df = base[base['Primary Country'] == country]
     return df['name_norm'].tolist(), df['Website'].tolist()
 
 def buscar_site(norm_name, names, sites, threshold):
+    # exact
     for nm, site in zip(names, sites):
         if norm_name == nm:
             return site
+    # fuzzy token_set_ratio
     m1 = process.extractOne(norm_name, names, scorer=fuzz.token_set_ratio)
     if m1 and m1[1] >= threshold:
         return sites[names.index(m1[0])]
+    # fuzzy partial_ratio
     m2 = process.extractOne(norm_name, names, scorer=fuzz.partial_ratio)
     if m2 and m2[1] >= threshold:
         return sites[names.index(m2[0])]
@@ -83,51 +87,50 @@ def buscar_site(norm_name, names, sites, threshold):
 
 # --- UI Inputs ---
 uploaded_list = st.file_uploader("📂 Sua lista de empresas (.xlsx)", type="xlsx")
-threshold      = st.slider("🔍 Similaridade mínima (%)", 50, 100, 85)
-pais           = st.selectbox("🌎 País", [""] + sorted(base['Primary Country'].unique()))
+if uploaded_list is None:
+    st.stop()
+# preview columns
+df_preview = pd.read_excel(uploaded_list, nrows=0)
+colunas = list(df_preview.columns)
+col_sel = st.selectbox("Selecione a coluna de empresas", colunas)
+threshold = st.slider("🔍 Similaridade mínima (%)", 50, 100, 85)
+pais = st.selectbox("🌎 País", [""] + sorted(base['Primary Country'].unique()))
 
 if st.button("▶️ Processar"):
-    if not uploaded_list or not pais:
-        st.error("Faça upload da lista e selecione o país.")
+    if not pais:
+        st.error("Selecione o país.")
         st.stop()
-
-    # 1) Load and normalize list
+    # load full df
     df_list = pd.read_excel(uploaded_list)
+    # rename selected column to EMPRESA
+    df_list.rename(columns={col_sel: 'EMPRESA'}, inplace=True)
     df_list['name_norm'] = df_list['EMPRESA'].map(normalize)
 
-    # 2) Prepare matching and fill Website
+    # matching websites
     names_norm, sites_norm = prepare_matching(pais)
     df_list['Website'] = df_list['name_norm'].apply(
         lambda x: buscar_site(x, names_norm, sites_norm, threshold)
     )
-
-    # 3) Lookup NEWACC owner & status
-    df_list['Account Owner']  = df_list['Website'].map(lookup_newacc_owner)
+    # lookup newacc
+    df_list['Account Owner'] = df_list['Website'].map(lookup_newacc_owner)
     df_list['Account Status'] = df_list['Website'].map(lookup_newacc_status)
-
-    # 4) Lookup opportunities
+    # lookup opps
     for key in ['wafwon','wafopps','apiwon','apiopps','gcwon','gcopps']:
         df_list[key.upper()] = df_list['Website'].map(lambda w, k=key: lookup_opp(k, w))
-
-    # 5) Compute product status
+    # product status
     def prod_status(row, won_col, opp_col):
         if pd.notna(row[won_col]): return 'Customer'
         if pd.notna(row[opp_col]): return 'Partner'
         return 'Free'
+    df_list['WAF Status'] = df_list.apply(lambda r: prod_status(r,'WAFWON','WAFOPPS'), axis=1)
+    df_list['API Status'] = df_list.apply(lambda r: prod_status(r,'APIWON','APIOPPS'), axis=1)
+    df_list['GC Status']  = df_list.apply(lambda r: prod_status(r,'GCWON','GCOPPS'), axis=1)
 
-    df_list['WAF Status'] = df_list.apply(lambda r: prod_status(r, 'WAFWON','WAFOPPS'), axis=1)
-    df_list['API Status'] = df_list.apply(lambda r: prod_status(r, 'APIWON','APIOPPS'), axis=1)
-    df_list['GC Status']  = df_list.apply(lambda r: prod_status(r, 'GCWON','GCOPPS'), axis=1)
-
-    # 6) Export to Excel
+    # export
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
         df_list.to_excel(writer, index=False, sheet_name='Account Plan')
     buffer.seek(0)
-
-    st.download_button(
-        "💾 Baixar Relatório Completo",
-        buffer,
-        file_name=f"AccountPlan_{pais}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+    st.download_button("💾 Baixar Relatório Completo", buffer,
+                       file_name=f"AccountPlan_{pais}.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
